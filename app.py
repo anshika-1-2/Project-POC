@@ -338,7 +338,8 @@ def nutrition_pie(rows):
 
 def dri_bar_chart(nut_rows, dri_raw):
     pairs = [("Calories","calories","kcal"),("Protein","protein_g","g"),
-             ("Fat","fat_max_g","g"),("Carbohydrate","carb_max_g","g")]
+             ("Fat","fat_max_g","g"),("Carbohydrate","carb_max_g","g"),
+             ("Salt","sodium_g","g")]
     lv_map = {r["Nutrient"]: r["Amount"] for r in nut_rows if isinstance(r.get("Amount"),float)}
     names,pcts = [],[]
     for nutrient,dri_key,_ in pairs:
@@ -349,7 +350,7 @@ def dri_bar_chart(nut_rows, dri_raw):
     if not names: return None
     colors = ["#2EC4B6" if p<=25 else "#4C9BE8" if p<=50 else "#F4A261" if p<=80 else "#E63946"
               for p in pcts]
-    fig,ax = plt.subplots(figsize=(4.5,2.4),facecolor="none")
+    fig,ax = plt.subplots(figsize=(4.5,3.0),facecolor="none")
     bars = ax.barh(names,pcts,color=colors,edgecolor="none",height=0.42)
     ax.axvline(100,color="#E63946",linestyle="--",linewidth=1.1,alpha=0.6,label="100% DRI")
     for bar,pct in zip(bars,pcts):
@@ -617,11 +618,14 @@ with left_col:
                     lv_map    = {r["Nutrient"]: r["Amount"] for r in nut_data["rows"]
                                  if isinstance(r.get("Amount"), float)}
                     comp_rows = []
+                    sodium_g = dri_raw.get("sodium_g")
+                    sodium_label = f"{sodium_g} g" if sodium_g else "1.5 g"
                     for nutrient,dkey,dlabel in [
                         ("Calories",    "calories",  f"{dri_raw.get('calories')} kcal"),
                         ("Protein",     "protein_g", f"{dri_raw.get('protein_g')} g"),
                         ("Fat",         "fat_max_g", f"{dri_raw.get('fat_max_g')} g max"),
                         ("Carbohydrate","carb_max_g",f"{dri_raw.get('carb_max_g')} g max"),
+                        ("Salt",        "sodium_g",  sodium_label),
                     ]:
                         lv = lv_map.get(nutrient); dv = dri_raw.get(dkey)
                         if lv is not None and dv:
