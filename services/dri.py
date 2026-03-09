@@ -348,5 +348,7 @@ def calculate_dri(
             "protein_g":  protein_rda,
             "fat_min_g":  fat_min_g,  "fat_max_g":  fat_max_g,
             "calories":   eer,
+            # Sodium AI (mg) looked up from mineral table — convert to g for comparison
+            "sodium_g":   round((minerals.get("Sodium (mg)", {}).get("rda") or 1500) / 1000, 3),
         },
     }
