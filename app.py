@@ -17,6 +17,7 @@ from services.detection import analyze_ingredients, JP_MANDATORY
 from services.storage    import save_image, save_record
 from services.dri        import calculate_dri
 from services.diet       import classify_diet
+from services.health_score import compute_health_score
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -57,6 +58,38 @@ st.markdown("""
 /* Metric tweak */
 [data-testid="stMetricValue"] { font-size:28px !important; font-weight:700 !important; }
 [data-testid="stMetricLabel"] { font-size:12px !important; color:#64748b !important; }
+
+/* Health score */
+.health-card {
+    border-radius:16px; padding:20px 24px; margin-bottom:16px;
+    display:flex; align-items:center; gap:20px;
+    border: 2px solid;
+}
+.health-healthy  { background:#f0faf4; border-color:#22c55e; }
+.health-moderate { background:#fffbeb; border-color:#f59e0b; }
+.health-unhealthy{ background:#fff1f2; border-color:#ef4444; }
+.health-grade {
+    font-size:48px; font-weight:900; line-height:1;
+    min-width:56px; text-align:center;
+}
+.health-healthy   .health-grade { color:#16a34a; }
+.health-moderate  .health-grade { color:#d97706; }
+.health-unhealthy .health-grade { color:#dc2626; }
+.health-body { flex:1; }
+.health-verdict { font-size:18px; font-weight:700; margin-bottom:2px; }
+.health-score-line { font-size:13px; color:#64748b; margin-bottom:8px; }
+.health-bar-wrap { background:#e2e8f0; border-radius:99px; height:8px; overflow:hidden; margin-bottom:10px; }
+.health-bar { height:8px; border-radius:99px; transition: width .4s; }
+.health-healthy   .health-bar { background: linear-gradient(90deg,#22c55e,#16a34a); }
+.health-moderate  .health-bar { background: linear-gradient(90deg,#fbbf24,#d97706); }
+.health-unhealthy .health-bar { background: linear-gradient(90deg,#f87171,#dc2626); }
+.health-tags { display:flex; flex-wrap:wrap; gap:6px; }
+.htag { font-size:11px; padding:2px 9px; border-radius:10px; font-weight:600; }
+.htag-neg { background:#fee2e2; color:#991b1b; }
+.htag-pos { background:#dcfce7; color:#166534; }
+.section-scores { display:flex; gap:10px; margin-top:10px; flex-wrap:wrap; }
+.sscore { font-size:11px; background:#f1f5f9; border-radius:8px;
+          padding:4px 10px; color:#475569; font-weight:600; }
 
 /* Diet cards */
 .diet-card {
@@ -217,13 +250,15 @@ def compute_confidence(jp, en):
 
     ing   = (jp or {}).get("ingredients") or {}
     items = ing.get("items") or [] if isinstance(ing, dict) else []
-    s["Ingredients"] = 100 if len(items)>=5 else 70 if len(items)>=2 else 40 if len(items)==1 else 0
+    # 1 ingredient is valid (e.g. 生乳100% = raw milk); penalise only if zero
+    s["Ingredients"] = 100 if len(items)>=5 else 80 if len(items)>=2 else 70 if len(items)==1 else 0
 
     alg = (jp or {}).get("allergens")
     if   alg is None:        s["Allergens"] = 0
     elif isinstance(alg, dict):
         st2, ai = alg.get("style"), alg.get("items") or []
-        s["Allergens"] = 100 if st2 and ai else 60 if st2 else 30
+        # style=none is valid (product has no declared allergens)
+        s["Allergens"] = 100 if st2 and ai else 80 if st2 == "none" else 60 if st2 else 30
     else: s["Allergens"] = 30
 
     nut    = (jp or {}).get("nutrition") or {}
@@ -235,11 +270,14 @@ def compute_confidence(jp, en):
 _NUT_LIMITS = {
     # (label, max_g_or_kcal, mg_threshold)
     # If value > mg_threshold, it was likely in mg — auto-convert to g
-    "Calories":     (9999, None),   # kcal — no mg conversion
-    "Protein":      (200,  None),
-    "Fat":          (200,  None),
-    "Carbohydrate": (500,  None),
-    "Salt":         (10,   100),    # >100 almost certainly mg, divide by 1000
+    "Calories":      (9999, None),
+    "Protein":       (200,  None),
+    "Fat":           (200,  None),
+    "Saturated Fat": (100,  None),
+    "Carbohydrate":  (500,  None),
+    "Sugar":         (300,  None),
+    "Fibre":         (100,  None),
+    "Salt":          (10,   100),    # >100 almost certainly mg
 }
 
 def _strip_to_float(val) -> float | None:
@@ -248,11 +286,20 @@ def _strip_to_float(val) -> float | None:
     Handles: 76, "76", "76kcal", "6.2g", "3.9 g", "227mg", etc.
     Also detects mg values and converts to g.
     Returns (numeric_value, is_mg) tuple.
+
+    REJECTS values expressed as percentages (e.g. "1.0%") — these are
+    compositional specs (乳脂肪分), not nutrition amounts in grams.
     """
     import re as _re
     if val is None:
         return None, False
     s = str(val).strip()
+    # "0%" or "0.0%" on JP labels means literally 0g — treat as zero
+    if _re.fullmatch(r"0+\.?0*\s*%", s):
+        return 0.0, False
+    # Reject non-zero percentages — composition specs like "1.0%", "8.4%以上"
+    if "%" in s:
+        return None, False
     is_mg = bool(_re.search(r"mg", s, _re.IGNORECASE))
     try:
         return float(s), is_mg
@@ -287,6 +334,18 @@ def parse_nutrition(english):
     nut = (english or {}).get("nutrition") or {}
     if not nut: return None
 
+    # Sanity: sugar is always a subset of carbohydrate
+    # If Stage 2 mapped carbohydrate value into sugar (identical values), null sugar
+    import re as _re2
+    def _qn(v):
+        if v is None: return None
+        m = _re2.search(r'\d+\.?\d*', str(v))
+        return float(m.group()) if m else None
+    sugar_v = _qn(nut.get("sugar"))
+    carb_v  = _qn(nut.get("carbohydrate"))
+    if sugar_v is not None and carb_v is not None and abs(sugar_v - carb_v) < 0.1:
+        nut["sugar"] = None  # identical → mis-mapped from carbs
+
     # Accept both long-form keys (calories_kcal, protein_g) and
     # short-form keys (calories, protein) that Stage 2 sometimes returns
     def _get(nut, *keys):
@@ -297,11 +356,14 @@ def parse_nutrition(english):
         return None
 
     field_map = [
-        (["calories_kcal", "calories"],              "Calories"),
-        (["protein_g",     "protein"],               "Protein"),
-        (["fat_g",         "fat"],                   "Fat"),
-        (["carbohydrate_g","carbohydrate","carbs"],   "Carbohydrate"),
-        (["salt_g",        "salt","sodium_g","sodium"],"Salt"),
+        (["calories_kcal",    "calories"],               "Calories"),
+        (["protein_g",        "protein"],                "Protein"),
+        (["fat_g",            "fat"],                    "Fat"),
+        (["saturated_fat_g",  "saturated_fat"],          "Saturated Fat"),
+        (["carbohydrate_g",   "carbohydrate","carbs"],   "Carbohydrate"),
+        (["sugar_g",          "sugar","sugars"],         "Sugar"),
+        (["fibre_g",          "fibre","fiber","dietary_fibre","dietary_fiber"], "Fibre"),
+        (["salt_g",           "salt","sodium_g","sodium"],"Salt"),
     ]
     rows = []
     for keys, label in field_map:
@@ -339,7 +401,7 @@ def nutrition_pie(rows):
 def dri_bar_chart(nut_rows, dri_raw):
     pairs = [("Calories","calories","kcal"),("Protein","protein_g","g"),
              ("Fat","fat_max_g","g"),("Carbohydrate","carb_max_g","g"),
-             ("Salt","sodium_g","g")]
+             ("Sugar","sugar_limit_g","g"),("Salt","sodium_g","g")]
     lv_map = {r["Nutrient"]: r["Amount"] for r in nut_rows if isinstance(r.get("Amount"),float)}
     names,pcts = [],[]
     for nutrient,dri_key,_ in pairs:
@@ -350,7 +412,7 @@ def dri_bar_chart(nut_rows, dri_raw):
     if not names: return None
     colors = ["#2EC4B6" if p<=25 else "#4C9BE8" if p<=50 else "#F4A261" if p<=80 else "#E63946"
               for p in pcts]
-    fig,ax = plt.subplots(figsize=(4.5,3.0),facecolor="none")
+    fig,ax = plt.subplots(figsize=(4.5,3.5),facecolor="none")
     bars = ax.barh(names,pcts,color=colors,edgecolor="none",height=0.42)
     ax.axvline(100,color="#E63946",linestyle="--",linewidth=1.1,alpha=0.6,label="100% DRI")
     for bar,pct in zip(bars,pcts):
@@ -383,6 +445,10 @@ with left_col:
     )
     if uploaded:
         st.image(uploaded, use_container_width=True)
+        # Clear stale result if a different image is uploaded
+        _sig = uploaded.name + str(uploaded.size)
+        if st.session_state.get("_last_uploaded","") != _sig:
+            st.session_state.result = None
 
     user_name     = st.session_state.sb_name.strip()
     user_allergen = st.session_state.sb_allergen
@@ -396,6 +462,7 @@ with left_col:
         st.warning("✏️ Enter your name in the sidebar first.")
 
     # ── Run scan ──────────────────────────────────────────────────────────────
+    _upload_sig = (uploaded.name + str(uploaded.size)) if uploaded else ""
     if scan_clicked and scan_ready:
         with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded.name).suffix) as tmp:
             tmp.write(uploaded.read()); tmp_path = tmp.name
@@ -420,6 +487,12 @@ with left_col:
                 nutrition        = en_nutrition,
                 allergens        = detection["allergens"],
             )
+            health_result = compute_health_score(
+                ingredients_flat = ingredients_text,
+                nutrition        = en_nutrition,
+                additives        = detection["additives"],
+                dri_raw          = (st.session_state.dri or {}).get("_raw"),
+            )
 
             saved_img = save_image(tmp_path)
             user_id   = save_record(
@@ -438,10 +511,12 @@ with left_col:
                 "ocr":           ocr_result,
                 "detection":     detection,
                 "diet":          diet_result,
+                "health":        health_result,
                 "ingredients":   ingredients_text,
                 "user_allergen": user_allergen,
                 "confidence":    compute_confidence(japanese, english),
             }
+            st.session_state._last_uploaded = uploaded.name + str(uploaded.size)
 
     # ── Show results ──────────────────────────────────────────────────────────
     if st.session_state.result:
@@ -542,6 +617,40 @@ with left_col:
             else:
                 st.markdown('<span class="pill pill-green">✅ None detected</span>', unsafe_allow_html=True)
 
+        # ── Health Score ───────────────────────────────────────────────────────
+        health = r.get("health") or {}
+        if health:
+            st.markdown('<p class="sec-header">🏥 Health Score</p>', unsafe_allow_html=True)
+            score   = health.get('score', 0)
+            verdict = health.get('verdict', 'Moderate')
+            grade   = health.get('grade', 'C')
+            secs    = health.get('sections', {})
+            t_flags = health.get('top_flags', [])
+            t_boost = health.get('top_boosts', [])
+            vcls    = {'Healthy':'health-healthy','Moderate':'health-moderate','Unhealthy':'health-unhealthy'}.get(verdict,'health-moderate')
+
+            tags_html = ''
+            for f in t_flags[:3]: tags_html += f'<span class="htag htag-neg">✗ {f}</span>'
+            for b in t_boost[:2]: tags_html += f'<span class="htag htag-pos">✓ {b}</span>'
+
+            sec_html = ''
+            sec_labels = {'ingredients':'Ingredients','macros':'Macros','sodium':'Sodium','additives':'Additives'}
+            for sk, sv in secs.items():
+                sec_html += f'<span class="sscore">{sec_labels.get(sk,sk).title()} {sv["score"]}/{sv["max"]}</span>'
+
+            st.markdown(f'''
+            <div class="health-card {vcls}">
+                <div class="health-grade">{grade}</div>
+                <div class="health-body">
+                    <div class="health-verdict">{verdict}</div>
+                    <div class="health-score-line">Score: {score}/100</div>
+                    <div class="health-bar-wrap"><div class="health-bar" style="width:{score}%"></div></div>
+                    <div class="health-tags">{tags_html}</div>
+                    <div class="section-scores">{sec_html}</div>
+                </div>
+            </div>
+            ''', unsafe_allow_html=True)
+
         # ── Diet Classification ───────────────────────────────────────────────
         diet = r.get("diet") or {}
         if diet:
@@ -618,14 +727,17 @@ with left_col:
                     lv_map    = {r["Nutrient"]: r["Amount"] for r in nut_data["rows"]
                                  if isinstance(r.get("Amount"), float)}
                     comp_rows = []
-                    sodium_g = dri_raw.get("sodium_g")
+                    sodium_g     = dri_raw.get("sodium_g")
                     sodium_label = f"{sodium_g} g" if sodium_g else "1.5 g"
+                    sugar_lim    = dri_raw.get("sugar_limit_g")
+                    sugar_label  = f"{sugar_lim} g (WHO 10%)" if sugar_lim else "—"
                     for nutrient,dkey,dlabel in [
-                        ("Calories",    "calories",  f"{dri_raw.get('calories')} kcal"),
-                        ("Protein",     "protein_g", f"{dri_raw.get('protein_g')} g"),
-                        ("Fat",         "fat_max_g", f"{dri_raw.get('fat_max_g')} g max"),
-                        ("Carbohydrate","carb_max_g",f"{dri_raw.get('carb_max_g')} g max"),
-                        ("Salt",        "sodium_g",  sodium_label),
+                        ("Calories",    "calories",       f"{dri_raw.get('calories')} kcal"),
+                        ("Protein",     "protein_g",      f"{dri_raw.get('protein_g')} g"),
+                        ("Fat",         "fat_max_g",      f"{dri_raw.get('fat_max_g')} g max"),
+                        ("Carbohydrate","carb_max_g",     f"{dri_raw.get('carb_max_g')} g max"),
+                        ("Sugar",       "sugar_limit_g",  sugar_label),
+                        ("Salt",        "sodium_g",       sodium_label),
                     ]:
                         lv = lv_map.get(nutrient); dv = dri_raw.get(dkey)
                         if lv is not None and dv:
@@ -646,6 +758,12 @@ with left_col:
 
         with st.expander("🔬 Raw OCR output (Japanese)", expanded=False):
             st.json(japanese or {})
+            s1_raw = ocr.get("s1_raw") or ""
+            s2_raw = ocr.get("s2_raw") or ""
+            st.caption("Stage 1 raw (OCR — Japanese):")
+            st.code(s1_raw[:3000] if s1_raw else "(empty — model returned no output)", language="json")
+            st.caption("Stage 2 raw (Translation — English):")
+            st.code(s2_raw[:3000] if s2_raw else "(empty — model returned no output)", language="json")
 
 
 # ────────────────────────────────────────────────────────────────────────────
