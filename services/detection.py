@@ -174,7 +174,7 @@ def detect_additives(ingredient_text: str, return_df: bool = False):
 
     df = (
         pd.DataFrame(results)
-        .drop_duplicates(subset=["ingredient_token", "additive_id"])
+        .drop_duplicates(subset=["additive_name"])
         .sort_values("additive_id")
         .reset_index(drop=True)
     )

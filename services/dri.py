@@ -350,5 +350,9 @@ def calculate_dri(
             "calories":   eer,
             # Sodium AI (mg) looked up from mineral table — convert to g for comparison
             "sodium_g":   round((minerals.get("Sodium (mg)", {}).get("rda") or 1500) / 1000, 3),
+            # Sugar: WHO recommends free sugars < 10% of total energy (kcal / 4 = g)
+            # Hard limit guidance: <5% for additional health benefit
+            "sugar_limit_g":      round(eer * 0.10 / 4, 1),   # 10% EER → g
+            "sugar_limit_low_g":  round(eer * 0.05 / 4, 1),   # 5% EER → g (WHO target)
         },
     }
