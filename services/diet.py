@@ -50,7 +50,7 @@ def _match_any(tokens: list[str], blocklist: list[str]) -> list[str]:
         for tok in tokens:
             if tok in matched_tokens:
                 continue
-            if block in tok or tok in block:
+            if block in tok:  # block term must appear IN the ingredient token
                 # Avoid adding near-duplicates (e.g. "sugar" + "white sugar" → keep "white sugar")
                 if not any(block in existing or existing in block for existing in hits):
                     hits.append(block)
