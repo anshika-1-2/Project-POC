@@ -29,13 +29,24 @@ def _load_model():
     global _model, _processor, _device
     if _model is not None:
         return
-    from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+    from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
     from qwen_vl_utils import process_vision_info  # noqa
     _device = "cuda" if torch.cuda.is_available() else "cpu"
     model_id = "Qwen/Qwen2.5-VL-7B-Instruct"
-    _processor = AutoProcessor.from_pretrained(model_id, min_pixels=200*200, max_pixels=1280*28*28)
+    _processor = AutoProcessor.from_pretrained(
+        model_id, min_pixels=200*200, max_pixels=1280*28*28
+    )
+    quant_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4",
+    )
     _model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
-        model_id, torch_dtype=torch.bfloat16, device_map="auto")
+        model_id,
+        quantization_config=quant_config,
+        device_map="auto",
+    )
     _model.eval()
 
 
@@ -61,10 +72,12 @@ PROMPT_OCR = (
     "Rules:\n"
     "- ingredients.raw_text: copy ONLY the content after the 原材料名 label — verbatim\n"
     "- ingredients.items: split raw_text on 、(Japanese comma) only\n"
-    "- allergens.items: extract names from （）brackets AND/OR after 一部に AND/OR after （N品目中）\n"
+    "- allergens.items: extract ONLY from the 本品に含まれているアレルゲン section OR （）brackets OR after 一部に OR after （N品目中）\n"
+    "- allergens.items: DO NOT include allergens from 共通の設備 (cross-contact manufacturing) statements\n"
     "- allergens.style: individual | collective | both | none\n"
     "- nutrition: copy each number+unit exactly as printed (e.g. 174kcal, 3.6g, 0g)\n"
-    "- sugar field: 糖質 or うち糖類 row — copy number+unit, drop うち prefix\n"
+    "- sugar field: ONLY 糖質 or うち糖類 row — null if not present; do NOT use 食塩相当量\n"
+    "- salt field: 食塩相当量 row — copy number+unit exactly\n"
     "- saturated_fat: 飽和脂肪酸 row — null if not present\n"
     "- fibre: 食物繊維 row — null if not present\n"
     "- If two nutrition columns exist (per bag + per 100g), use the per-bag column\n"
@@ -90,12 +103,14 @@ PROMPT_TRANSLATE_TEMPLATE = (
     "- allergens.items: translate each allergen name to English\n"
     "- nutrition.basis: translate serving note (e.g. 1袋(51g)当たり→per bag (51g), 100gあたり→per 100g)\n"
     "- nutrition values: number only, no units (e.g. 174kcal→174, 3.6g→3.6, 0g→0)\n"
-    "- nutrition.sugar: strip うち prefix, return number only (e.g. うち28.0g→28.0)\n"
+    "- nutrition.sugar: ONLY 糖質 row value, number only — null if no separate 糖質 row exists\n"
+    "- nutrition.salt: 食塩相当量 value, number only — do NOT confuse with sugar\n"
     "- nutrition.saturated_fat: 飽和脂肪酸 value, number only — null if absent\n"
     "- nutrition.fibre: 食物繊維 value, number only — null if absent\n"
     "- 乳脂肪分 and 無脂乳固形分 are composition % specs — set fat to null if only % present\n"
     "- 0g and 0% both become 0\n"
     "- ingredients: do NOT include product slogans or handling text — only ingredient names\n"
+    "- allergens.items: only allergens that are IN the product — exclude cross-contact (共通設備) allergens\n"
     "\n"
     "Allergens: 卵=egg 乳=milk 小麦=wheat そば=buckwheat 落花生=peanut えび=shrimp かに=crab "
     "くるみ=walnut アーモンド=almond カシューナッツ=cashew nut キウイフルーツ=kiwi fruit "
@@ -156,8 +171,8 @@ def _generate(messages, has_image, max_new_tokens=768):
     with torch.no_grad():
         out = _model.generate(
             **inputs, max_new_tokens=max_new_tokens,
-            temperature=0.05, do_sample=True,
-            repetition_penalty=1.1, top_p=0.9,
+            do_sample=False,
+            repetition_penalty=1.1,
         )
     latency = round(time.time() - t0, 2)
     new_toks = out.shape[1] - inputs["input_ids"].shape[1]
@@ -228,12 +243,25 @@ def extract_label(image_path: str) -> dict:
         split_items = [t for item in (raw_items.get("items") or []) for t in _smart_split(str(item))]
     else:
         split_items = _smart_split(str(raw_items))
+
+    # Strip product name if it leaked as first ingredient
+    # (model sometimes copies 名称 value before 原材料名 content)
+    en_pname = (english.get("product_name") or "").strip().lower()
+    if en_pname and split_items:
+        first = split_items[0].strip().lower()
+        if first == en_pname or en_pname in first:
+            split_items = split_items[1:]
+
     ingredients_flat = ", ".join(split_items)
 
-    # Append allergen terms (English only, no duplicates)
+    # Append allergen terms: only use en_alg.items (which Stage 1 now filters to
+    # in-product allergens only, excluding cross-contact 共通設備 declarations).
+    # Do NOT fall back to translated_jp — that can include cross-contact allergens
+    # that the model extracted from the shared-equipment warning sentence.
     def _is_english(s): return bool(str(s).strip()) and all(ord(c) < 0x3000 for c in str(s))
     existing_lower = {t.strip().lower() for t in ingredients_flat.split(",") if t.strip()}
-    new_terms = [t for t in dict.fromkeys((en_alg.get("items") or []) + translated_jp)
+    in_product_allergens = en_alg.get("items") or []
+    new_terms = [t for t in dict.fromkeys(in_product_allergens)
                  if _is_english(t) and t.lower() not in existing_lower]
     if new_terms:
         ingredients_flat = (ingredients_flat + ", " + ", ".join(new_terms)).strip(", ")

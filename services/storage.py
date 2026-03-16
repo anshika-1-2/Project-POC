@@ -32,9 +32,12 @@ FIELDNAMES = [
     "dri_eer_kcal",
     # Scan
     "image_path",
+    "product_name",
     "ingredients",
     "detected_allergens",
     "detected_additives",
+    "health_score",
+    "health_grade",
     "timestamp",
 ]
 
@@ -66,6 +69,9 @@ def save_record(
     detected_allergens: list[str],
     detected_additives: list[tuple[int, str]],
     dri: dict | None = None,         # full dict from calculate_dri()
+    product_name: str = "",
+    health_score: int | None = None,
+    health_grade: str = "",
 ) -> str:
     """
     Append one scan record to the CSV.
@@ -93,9 +99,12 @@ def save_record(
         "dri_eer_kcal":       (dri or {}).get("eer", ""),
         # Scan fields
         "image_path":         image_path,
+        "product_name":       product_name or "",
         "ingredients":        ingredients,
         "detected_allergens": allergens_str,
         "detected_additives": additives_str,
+        "health_score":       health_score if health_score is not None else "",
+        "health_grade":       health_grade or "",
         "timestamp":          datetime.now().isoformat(timespec="seconds"),
     }
 
@@ -104,4 +113,3 @@ def save_record(
         writer.writerow(row)
 
     return user_id
-

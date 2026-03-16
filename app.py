@@ -18,6 +18,7 @@ from services.storage    import save_image, save_record
 from services.dri        import calculate_dri
 from services.diet       import classify_diet
 from services.health_score import compute_health_score
+from services.smart_pairing import render_smart_pairing_tab, get_pairings
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -516,6 +517,19 @@ with left_col:
                 "user_allergen": user_allergen,
                 "confidence":    compute_confidence(japanese, english),
             }
+
+            # ── Smart Pairing nutrition dict (adapted format) ──────────────
+            _en_nut = (ocr_result.get("english") or {}).get("nutrition") or {}
+            st.session_state.result["smart_pairing_nd"] = {
+                "product_name":  (ocr_result.get("english") or {}).get("product_name") or "Scanned Product",
+                "calories":      _en_nut.get("calories"),
+                "protein":       _en_nut.get("protein"),
+                "fat":           _en_nut.get("fat"),
+                "carbohydrates": _en_nut.get("carbohydrate"),
+                "sodium":        _en_nut.get("salt"),      # his OCR key is "salt"
+                "sugar":         _en_nut.get("sugar"),
+                "fiber":         _en_nut.get("fibre"),     # his OCR key is "fibre"
+            }
             st.session_state._last_uploaded = uploaded.name + str(uploaded.size)
 
     # ── Show results ──────────────────────────────────────────────────────────
@@ -749,6 +763,8 @@ with left_col:
                     if comp_rows:
                         st.dataframe(pd.DataFrame(comp_rows).set_index("Nutrient"),
                                      use_container_width=True)
+                        # Save for Smart Pairing DRI-personalised suggestions
+                        st.session_state.result["comp_rows"] = comp_rows
                 else:
                     st.info("Not enough nutrition data for comparison.")
             else:
@@ -764,6 +780,26 @@ with left_col:
             st.code(s1_raw[:3000] if s1_raw else "(empty — model returned no output)", language="json")
             st.caption("Stage 2 raw (Translation — English):")
             st.code(s2_raw[:3000] if s2_raw else "(empty — model returned no output)", language="json")
+
+        # ── Smart Pairing ─────────────────────────────────────────────────────
+        sp_nd      = r.get("smart_pairing_nd") or {}
+        comp_rows  = r.get("comp_rows")         # None if user hasn't calculated DRI yet
+
+        # Only show Smart Pairing if we have at least some nutrition data from OCR
+        _has_nutrition = any(v is not None for k, v in sp_nd.items() if k != "product_name")
+        if _has_nutrition:
+            st.divider()
+            st.markdown('<p class="sec-header">🍽️ Smart Pairing & Recipes</p>',
+                        unsafe_allow_html=True)
+            render_smart_pairing_tab(
+                nutrition_dict = sp_nd,
+                category       = "packaged_meals",
+                dri_gaps       = comp_rows,
+                user_allergen  = r.get("user_allergen", ""),
+            )
+        else:
+            st.divider()
+            st.caption("ℹ️ Smart Pairing requires nutrition data — not enough was extracted from this label.")
 
 
 # ────────────────────────────────────────────────────────────────────────────

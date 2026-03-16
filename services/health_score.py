@@ -31,6 +31,23 @@ ADDITIVE_TIERS: dict[str, int] = {
     "citric acid": 0, "lactic acid": 0, "malic acid": 0,
     "calcium carbonate": 0, "sodium bicarbonate": 0,
     "beeswax": 0, "carnauba wax": 0,
+    # Functional class names (category-level JP label declarations)
+    # Benign / routine functional classes
+    "glazing agent": 0, "gloss agent": 0,
+    "flavoring": 0, "flavouring": 0,
+    "emulsifier": 0,
+    "thickener": 0,
+    "gelling agent": 0,
+    "antioxidant": 0,
+    "acidulant": 0,
+    "leavening agent": 0,
+    "seasoning": 0,
+    "safflower pigment": 0, "carotene": 0, "anthocyanin": 0,
+    "vitamin c (antioxidant)": 0,
+    # Functional classes that warrant caution (specific substance unknown)
+    "food coloring": 1, "food colouring": 1,
+    "sweetener": 1,      # could be artificial; flag for awareness
+    "preservative": 1,   # could be sodium benzoate etc.; flag for awareness
     # Caution
     "sodium nitrite": 1, "sodium nitrate": 1,
     "potassium sorbate": 1, "sodium benzoate": 1,
@@ -105,7 +122,8 @@ def _score_ingredients(ingredients_flat: str) -> tuple[int, list[str], list[str]
             if rf in tok:
                 penalty = 8 if i < 3 else 4
                 score  -= penalty
-                flags.append(f"{'⚠️ High' if i < 3 else 'Low'} position: {rf.title()}")
+                pos_label = f"Top-{i+1} ingredient" if i < 3 else f"#{i+1} ingredient"
+                flags.append(f"{rf.title()} listed early ({pos_label})")
                 break
 
     # Positive ingredients
@@ -204,8 +222,15 @@ def _score_macros(
     if possible == 0:
         return 15, ["No nutrition data — macros unscored"], []
 
-    # Scale earned to 30 pts proportionally based on data coverage
-    score = round(earned / possible * 30)
+    # Scale earned to 30 pts proportionally based on data coverage.
+    # When coverage is low (few signals present), blend towards neutral (15)
+    # so a label with only protein data isn't harshly penalised for missing fields.
+    score_raw = round(earned / possible * 30)
+    coverage  = possible / 30          # 0.0–1.0; 1.0 = all 4 signals present
+    if coverage < 1.0:
+        score = round(score_raw * coverage + 15 * (1 - coverage))
+    else:
+        score = score_raw
     return max(0, min(30, score)), flags[:4], boosts[:4]
 
 

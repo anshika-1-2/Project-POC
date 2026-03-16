@@ -16,7 +16,6 @@ Each returns:
     "positives": ["No animal products detected", ...],
   }
 """
-
 from __future__ import annotations
 import json
 import re
@@ -50,7 +49,7 @@ def _match_any(tokens: list[str], blocklist: list[str]) -> list[str]:
         for tok in tokens:
             if tok in matched_tokens:
                 continue
-            if block in tok or tok in block:
+            if block in tok:  # block term appears IN the ingredient token
                 # Avoid adding near-duplicates (e.g. "sugar" + "white sugar" → keep "white sugar")
                 if not any(block in existing or existing in block for existing in hits):
                     hits.append(block)
